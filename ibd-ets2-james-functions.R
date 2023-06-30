@@ -1,11 +1,13 @@
 
 ## prepare summary data from IBD
-read_ibd=function() {
-  infile=file.path(ROOTDIR, "IBD_DeLange_28067908_1-hg38.tsv.gz")
+read_raw=function(f) {
+  infile=file.path(ROOTDIR, f)
   nm=paste0("zcat ",infile," | head ") %>% fread(cmd=.)
   data=paste0("zcat ",infile," | awk '$3==21 && $4 > 37500000 && $4 < 40000000'") %>%
     fread(cmd=.)
   setnames(data, names(nm))
+  if(all(is.na(data$hm_BETA))) # PSC
+      data[,hm_BETA:=log(hm_OR)]
   return(data)
 }
 
@@ -13,11 +15,12 @@ read_ibd=function() {
 
 
 ## get LD
-get_mafld=function(data) {
+get_mafld=function(bp,chr="21") {
+    bp  %<>%  unique() 
   ## ss=strsplit(snps,":") %>% do.call("rbind",.) %>%as.data.frame()
   ##   ss$V1 %<>% paste0("chr",.)
-  ss=data.table(chr=paste0("chr",data$hm_CHR),
-                bp=data$hm_BP)
+  ss=data.table(chr=paste0("chr",chr),
+                bp=bp)
   tmp=tempfile()
   tmp.plink=tempfile()
   write.table(ss, file=tmp, quote=FALSE, col.names=FALSE,row.names=FALSE,sep="\t")
@@ -58,26 +61,31 @@ get_mafld=function(data) {
   ## LD=ld(ref,ref,stat="R",symmetric=TRUE)
   dimnames(LD) %<>% lapply(., function(x) sub("chr","",x))
 
-  data[,pid:=paste(hm_CHR,hm_BP,sep=":")]
-  table(data$pid %in% names(MAF))
-  data=data[ pid %in% names(MAF) & !is.na(hm_BETA)]
-  MAF=MAF[data$pid]
-  LD=LD[data$pid, data$pid]
+  ss[,pid:=sub("chr","",paste(chr,bp,sep=":"))]
+    message("data pid found in MAFLD data:")
+    print(table(ss$pid %in% names(MAF)))
+  ss=ss[ pid %in% names(MAF)] # & !is.na(hm_BETA)]
+  MAF=MAF[ss$pid]
+  LD=LD[ss$pid, ss$pid]
   ref_snps=rbind(ref16@snps,ref17@snps); rownames(ref_snps)=sub("chr","",rownames(ref_snps))
-  ref_alleles=with(ref_snps[data$pid,], paste(allele.1, allele.2, sep="/"))
-  return(list(MAF=MAF,LD=LD,ref_alleles=ref_alleles))
+  ref_alleles=with(ref_snps[ss$pid,], paste(allele.1, allele.2, sep="/"))
+  return(list(pid=names(MAF),MAF=MAF,LD=LD,ref_alleles=ref_alleles))
 }
 
 ## check alleles
 make_ibd_dataset=function(data, MAFLD) {
   data[,alleles:=paste(hm_ALT,hm_REF,sep="/")]
   data[,pid:=paste(hm_CHR,hm_BP,sep=":")]
-  data=data[ pid %in% names(MAFLD$MAF) ]
-  print(table(data=data$alleles, ref=MAFLD$ref_alleles))
+  data=data[ pid %in% names(MAFLD$MAF) & !is.na(hm_BETA)]
+  ## mfld=MAFLD[ match(data$
+  message("allele comparison")
+  m= match(data$pid, MAFLD$pid) 
+  print(table(data=data$alleles, ref=MAFLD$ref_alleles[m]))
   all.equal(data$alleles, MAFLD$ref_alleles) # 1 mismatch T/TG vs G/T
-  data=data[alleles!="T/TG"]
-  MAF=MAFLD$MAF[data$pid]
-  LD=MAFLD$LD[data$pid, data$pid]
+  data=data[data$alleles==MAFLD$ref_alleles[ m ], ]
+  m= match(data$pid, MAFLD$pid) 
+  MAF=MAFLD$MAF[m]
+  LD=MAFLD$LD[m,m]
 
   dataset=with(data, list(snp=pid,
                           position=hm_BP,
@@ -214,7 +222,8 @@ formatsusie_eqtl=function(LBF,CS) {
     colnames(tmp_susie$lbf_variable)=paste(lbf$chromosome, # chromosome
                                            lbf$position, # position
                                            sep=":")
-    rownames(tmp_susie$lbf_variable)=paste0("L",seq_along(use))
+      rownames(tmp_susie$lbf_variable)=paste0("L",seq_along(use))
+      class(tmp_susie)=c(class(tmp_susie),"susie") # to fool coloc.susie
     tmp_susie
   })
   names(S)=names(LBF)
@@ -222,16 +231,26 @@ formatsusie_eqtl=function(LBF,CS) {
 }
 
 make_eqtl_dataset=function(eqtl_data) {
-  ## make snps data for ECAT
-  DATA=lapply(eqtl_data, function(d)
-    list(snp=paste(d$chromosome,d$position,sep=":"),
-         position=d$position,
-         beta=d$beta,
-         varbeta=d$se^2,
-         N=d$an[1],
-         type="quant"))
-  names(DATA)=names(eqtl_data)
-  DATA
+    ## make snps data for ECAT
+    DATA=lapply(eqtl_data, function(d)
+        list(snp=paste(d$chromosome,d$position,sep=":"),
+             position=d$position,
+             beta=d$beta,
+             varbeta=d$se^2,
+             N=d$an[1],
+             type="quant"))
+    names(DATA)=names(eqtl_data)
+    ## rm dup snps
+    for(i in seq_along(DATA)) {
+        w=which(duplicated(DATA[[i]]$snp))
+        if(length(w)) {
+            DATA[[i]]$snp=DATA[[i]]$snp[-w]
+            DATA[[i]]$position=DATA[[i]]$position[-w]
+            DATA[[i]]$beta=DATA[[i]]$beta[-w]
+            DATA[[i]]$varbeta=DATA[[i]]$varbeta[-w]
+        }
+    }
+    DATA
 }
 
 
@@ -244,74 +263,127 @@ make_eqtl_dataset=function(eqtl_data) {
 run_susie_traitlists=
   function(todo, ...) {
     ret=lapply(1:nrow(todo), function(i) {
-      cat(i,"\t")
+        message(i)
       a=run_susie(d1=todo$d1[[i]], d2=todo$d2[[i]], ...)
     }) %>% rbindlist(., fill=TRUE)
   }
-run_susie= function(d1,d2,DATA,SUSIE.FM,p1=1e-4,p2=1e-4,p12=5e-6,...) {
-  ## d1=trait name
-  ## d2=trait name
+
+
+
+run_susie=function(d1,d2,DATA,SUSIE) {
+  ## d1=trait idx
+  ## d2=trait idx
   ## message("susie coloc: ",d1,"\t",d2)
   dstats1 <- DATA[[d1]] #, list(LD=LD, MAF=MAF))
   dstats2 <- DATA[[d2]] #, list(LD=LD, MAF=MAF))
+  susie1=SUSIE[[d1]]
+  susie2=SUSIE[[d2]]
   if(frac_overlap(dstats1$snp,dstats2$snp)==0)
     return(NULL)
-  snps_common=intersect(dstats1$snp, dstats2$snp)
-  ## if(ind[[d1]]=="susie")
-    snps_common %<>% intersect(., colnames(SUSIE.FM[[d1]]$lbf_variable))
-  ## if(ind[[d2]]=="susie")
-    snps_common %<>% intersect(., colnames(SUSIE.FM[[d2]]$lbf_variable))
   ## prep work
-  ## get BF matrix if not susie
-  message(d1,"\t",d2,"\tnsnps = ",length(snps_common))
-  makebf=function(nm) {
-    bf1=SUSIE.FM[[nm]]$lbf_variable[ SUSIE.FM[[nm]]$sets$cs_index, , drop=FALSE]
-    bf1[,snps_common,drop=FALSE]
+  cs1=length(susie1$sets$cs)>0
+  cs2=length(susie2$sets$cs)>0
+  if(!cs1) {
+    if(DATA[[d1]]$type=="quant" & !("sdY" %in% names(DATA[[d1]])))
+      DATA[[d1]]$sdY=1
+    fm=finemap.abf(DATA[[d1]])
+    bf1=structure(fm$lABF., names=fm$snp)
   }
-  bf1=makebf(d1)
-  bf2=makebf(d2)
-  if(is.null(bf2))
-    return(NULL)
-
-  prior_values=list(p1=1e-4, p2=1e-4, p12=5e-6)
-
+  if(!cs2) {
+    if(DATA[[d2]]$type=="quant" & !("sdY" %in% names(DATA[[d2]])))
+      DATA[[d2]]$sdY=1
+    fm=finemap.abf(DATA[[d2]])
+    bf2=structure(fm$lABF., names=fm$snp)
+  }
   ## do the coloc
-  tmp=coloc::coloc.bf_bf(bf1, bf2,
-                         p1=prior_values$p1, p2=prior_values$p2, p12=prior_values$p12)$summary
-  ## fix idx of any susie
-  if(ind[[d1]]=="susie")
-    tmp$idx1=SUSIE.FM[[d1]]$sets$cs_index[ tmp$idx1 ]
-  if(ind[[d2]]=="susie")
-    tmp$idx2=SUSIE.FM[[d2]]$sets$cs_index[ tmp$idx2 ]
-
+  if(cs1 & cs2) {
+    tmp=coloc::coloc.susie(susie1, susie2)$summary
+  } else if(!cs1 & !cs2) {
+    tmp=coloc::coloc.bf_bf(bf1,bf2)$summary
+  } else if(cs1 & !cs2) {
+    tmp=coloc::coloc.susie_bf(susie1,bf2)$summary
+  } else {
+    tmp=coloc::coloc.susie_bf(susie2,bf1)$summary
+    ## switch trait order
+    allnm=names(copy(tmp))
+    setnames(tmp,c("hit1","hit2","idx1","idx2"),c("hit2","hit1","idx2","idx1"))
+    tmp=tmp[,allnm,with=FALSE]
+  }
   ## annotate
   if(!is.null(tmp)) {
     tmp[,c("trait1","trait2"):=list(d1,d2)]
-    tmp[,ind1:=ind[d1]][,ind2:=ind[d2]]
-    if(ind[d1]!="ecat")
+    if("varbeta" %in% names(dstats1))
       tmp[,hit1.margz:=(dstats1$beta/sqrt(dstats1$varbeta))[match(tmp$hit1,dstats1$snp)]]
-    if(ind[d2]!="ecat")
+    if("varbeta" %in% names(dstats2))
       tmp[,hit2.margz:=(dstats2$beta/sqrt(dstats2$varbeta))[match(tmp$hit2,dstats2$snp)]]
   }
   tmp
 }
 
-collate_data=function(s, dataset, eqtl_s, eqtl_dataset) {
-  list(ind=c(structure(rep("susie",1),names="IBD"),
-        structure(rep("ecat",length(eqtl_s)), names=names(eqtl_s))),
-  DATA=c(list(IBD=dataset), eqtl_dataset),
-  SUSIE.FM=c(list(IBD=s), eqtl_s))
-  }
+## run_susie= function(d1,d2,DATA,SUSIE.FM,p1=1e-4,p2=1e-4,p12=5e-6,...) {
+##   ## d1=trait name
+##   ## d2=trait name
+##   ## message("susie coloc: ",d1,"\t",d2)
+##   dstats1 <- DATA[[d1]] #, list(LD=LD, MAF=MAF))
+##   dstats2 <- DATA[[d2]] #, list(LD=LD, MAF=MAF))
+##   if(frac_overlap(dstats1$snp,dstats2$snp)==0)
+##     return(NULL)
+##   snps_common=intersect(dstats1$snp, dstats2$snp)
+##   ## if(ind[[d1]]=="susie")
+##     snps_common %<>% intersect(., colnames(SUSIE.FM[[d1]]$lbf_variable))
+##   ## if(ind[[d2]]=="susie")
+##     snps_common %<>% intersect(., colnames(SUSIE.FM[[d2]]$lbf_variable))
+##   ## prep work
+##   ## get BF matrix if not susie
+##   message(d1,"\t",d2,"\tnsnps = ",length(snps_common))
+##   makebf=function(nm) {
+##     bf1=SUSIE.FM[[nm]]$lbf_variable[ SUSIE.FM[[nm]]$sets$cs_index, , drop=FALSE]
+##     bf1[,snps_common,drop=FALSE]
+##   }
+##   bf1=makebf(d1)
+##   bf2=makebf(d2)
+##   if(is.null(bf2))
+##     return(NULL)
 
+##   prior_values=list(p1=1e-4, p2=1e-4, p12=5e-6)
 
-run_coloc=function(data) {
+##   ## do the coloc
+##   tmp=coloc::coloc.bf_bf(bf1, bf2,
+##                          p1=prior_values$p1, p2=prior_values$p2, p12=prior_values$p12)$summary
+##   ## fix idx of any susie
+##   if(ind[[d1]]=="susie")
+##     tmp$idx1=SUSIE.FM[[d1]]$sets$cs_index[ tmp$idx1 ]
+##   if(ind[[d2]]=="susie")
+##     tmp$idx2=SUSIE.FM[[d2]]$sets$cs_index[ tmp$idx2 ]
+
+##   ## annotate
+##   if(!is.null(tmp)) {
+##     tmp[,c("trait1","trait2"):=list(d1,d2)]
+##     tmp[,ind1:=ind[d1]][,ind2:=ind[d2]]
+##     if(ind[d1]!="ecat")
+##       tmp[,hit1.margz:=(dstats1$beta/sqrt(dstats1$varbeta))[match(tmp$hit1,dstats1$snp)]]
+##     if(ind[d2]!="ecat")
+##       tmp[,hit2.margz:=(dstats2$beta/sqrt(dstats2$varbeta))[match(tmp$hit2,dstats2$snp)]]
+##   }
+##   tmp
+## }
+
+collate_data=function(susies, datasets,nm) {
+    list(ind=c(structure(rep("susie",length(susies)),names=nm[1:length(susies)]),
+               structure(rep("ecat",length(eqtl_s)), names=nm[-c(1:length(susies))])),
+         DATA=datasets,
+         SUSIE.FM=susies)
+}
+
+run_coloc=function(susies, datasets, nm) {
   ## concatenate
-
   message("running coloc...")
-  todo <- expand.grid(d1=c(names(data$ind)[1]),
-                      d2=c(names(data$ind)[-1]),
-                      stringsAsFactors=FALSE)  %>% as.data.table()
-  coloc_results=run_susie_traitlists(todo,data$DATA,data$SUSIE.FM)
+    todo <- data.table(d1=1, d2=2:length(susies))
+    ## expand.grid(d1=c(names(data$ind)[1]),
+    ##                   d2=c(names(data$ind)[-1]),
+    ##                   stringsAsFactors=FALSE)  %>% as.data.table()
+    coloc_results=run_susie_traitlists(todo,DATA=datasets,SUSIE=susies)
+    coloc_results[,trait1:=nm[trait1]][,trait2:=nm[trait2]]
   if(nrow(coloc_results)) {
     coloc_results <- coloc_results[!is.na(nsnps)]
     coloc_results <- coloc_results[!is.na(PP.H4.abf)]
@@ -320,25 +392,26 @@ run_coloc=function(data) {
   coloc_results
 }
 
-make_plots=function(data, coloc_results) {
-  # everything
-  t2=unique(c(coloc_results$trait2, grep("Fairfax",names(data$DATA),value=TRUE)))
-  png("coloc_all.png",height=9,width=15,units="in",res=300)
-par(mfrow=c(3,3))
-  plot_dataset(data$DATA[[1]], data$SUSIE.FM[[1]], main="IBD" ,xlim=c(38500000,39500000))
-  for(ti in t2)
-  plot_dataset(data$DATA[[ti]], data$SUSIE.FM[[ti]], main=ti, ,xlim=c(38500000,39500000))
-dev.off()
-print(coloc_results[ PP.H3.abf+PP.H4.abf > 0.5,.(trait2,idx2,PP.H1.abf,PP.H2.abf,PP.H3.abf,PP.H4.abf) ])
+make_plots=function(datasets, susies, coloc_results) {
+                                        # everything
+    t2=unique(c(coloc_results$trait2, grep("Fairfax",names(datasets),value=TRUE)))
+    png("coloc_all.png",height=9,width=15,units="in",res=300)
+    par(mfrow=c(3,3))
+    plot_dataset(datasets[[1]], susies[[1]], main="IBD" ,xlim=c(38500000,39500000))
+    for(ti in t2)
+        plot_dataset(datasets[[ti]], susies[[ti]], main=ti, ,xlim=c(38500000,39500000))
+    dev.off()
+    print(coloc_results[ PP.H3.abf+PP.H4.abf > 0.5,.(trait2,idx2,PP.H1.abf,PP.H2.abf,PP.H3.abf,PP.H4.abf) ])
 
-  # zoom
- t2= c("Fairfax_2014_microarray_monocyte_naive", "Fairfax_2014_microarray_monocyte_LPS24")
-  png("coloc_zoom.png",height=9,width=15,units="in",res=300)
-  par(mfrow=c(3,1))
-  plot_dataset(data$DATA[[1]], data$SUSIE.FM[[1]], main="IBD",xlim=c(39050000,39150000))
-  for(ti in t2)
-  plot_dataset(data$DATA[[ti]], data$SUSIE.FM[[ti]], main=ti,xlim=c(39050000,39150000))
-dev.off()
+                                        # zoom
+    t2= c("Fairfax_2014_microarray_monocyte_naive", "Fairfax_2014_microarray_monocyte_LPS24")
+    png("coloc_zoom.png",height=12,width=8,units="in",res=300)
+    par(mfrow=c(5,1))
+    for(ti in 1:3) 
+        plot_dataset(datasets[[ti]], susies[[ti]], main=names(datasets)[ti],xlim=c(39050000,39150000))
+    for(ti in t2)
+        plot_dataset(datasets[[ti]], susies[[ti]], main=ti,xlim=c(39050000,39150000))
+    dev.off()
 
 }
 
@@ -355,3 +428,12 @@ dev.off()
 ##   a=readLines(n=1)}
 
 ## cowplot::plot_grid(plotlist=plots)
+
+show_graph=function() {
+    require(igraph)
+    a=tar_network(targets_only=TRUE)
+    g=graph_from_edgelist(as.matrix(a$edges))
+    status=as.data.frame(a$vertices)[ match(names(V(g)), a$vertices$name), "status"]
+    V(g)$color= structure(c("grey","lightgreen","orange","red"),names=c("outdated","uptodate","started","errored")) [ status ]
+    plot(g)
+}
