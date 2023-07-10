@@ -11,6 +11,40 @@ read_raw=function(f) {
   return(data)
 }
 
+read_tak=function() {
+    infile="/home/cew54/share/Data/GWAS-summary/OrtizFernandez2021-TAK_MetaAnalysis_All5population_Collab.meta.gz"
+    if(!file.exists("taktmp/tak.gz-hg38.tsv.gz"))
+        system(paste0("mkdir taktmp; zcat ",infile,
+                      " | sed 's/A1/REF/' | sed 's/A2/ALT/' |gzip -c > taktmp/tak.gz;",
+                      " cd taktmp && ~/share2/GWAS_tools/01-Pipeline/pipeline_v5.3_beta.sh -f tak.gz"))
+    nm=paste0("zcat taktmp/tak.gz-hg38.tsv.gz | head  ") %>% fread(cmd=.)
+    data=paste0("zcat taktmp/tak.gz-hg38.tsv.gz | awk '$15==21 && $16 > 37500000 && $16 < 40000000'") %>%
+        fread(cmd=.)
+    setnames(data, names(nm))
+    ## table(data$BP38 %in% ibd_raw$hm_BP)
+    setnames(data, c("CHR38","BP38","ALT","REF","BETA"),c("hm_CHR","hm_BP","hm_ALT","hm_REF","hm_BETA"))
+    ## check alignment
+##   chr21_block16 21 37339402 39110976
+## chr21_block17 21 39110976 40017600
+    DIR="/home/cew54/share2/People/CHRIS/coloc-all"
+  refdata16=fread(file.path(DIR,"reference","byblock","chr21_block16.csv"))
+  refdata17=fread(file.path(DIR,"reference","byblock","chr21_block17.csv"))
+  refdata=rbind(refdata16,refdata17)
+  setnames(refdata,c("CHR","BP","REF","ALT","MAF"))
+  refdata[,gt:=paste(REF,ALT,sep="/")]
+    m=merge(data,refdata,by.x="hm_BP",by.y="BP",suffixes=c(".in",".ref"))
+    with(m, table(hm_REF,gt))
+   ## hm_REF A/C A/G A/T C/A C/G C/T G/A G/C G/T T/A T/C T/G
+   ##   A  63 293  44 151   0   0 674   0   0  96   0   0
+   ##   C 123   0   0  63  64 270   0 164   0   0 539   0
+   ##   G   0 493   0   0 148   0 230  68  53   0   0 133
+   ##   T   0   0  93   0   0 675   0   0 142  45 302  77 
+    m[,hm_ALT:=ifelse(hm_REF==REF,ALT,REF)]
+    m[,.(hm_CHR,hm_BP,hm_REF,hm_ALT,hm_BETA,SE)]
+}
+
+    
+
 ## ggplot(data, aes(x=hm_BP, y=-log10(pnorm(-abs(hm_BETA)/SE)*2))) + geom_point() + geom_vline(xintercept = c(38.5e+6,39.5e+6),col="red")
 
 
@@ -72,6 +106,9 @@ get_mafld=function(bp,chr="21") {
   return(list(pid=names(MAF),MAF=MAF,LD=LD,ref_alleles=ref_alleles))
 }
 
+strReverse <- function(x)
+    sapply(lapply(strsplit(x, NULL), rev), paste, collapse="")
+
 ## check alleles
 make_ibd_dataset=function(data, MAFLD) {
   data[,alleles:=paste(hm_ALT,hm_REF,sep="/")]
@@ -81,13 +118,18 @@ make_ibd_dataset=function(data, MAFLD) {
   message("allele comparison")
   m= match(data$pid, MAFLD$pid) 
   print(table(data=data$alleles, ref=MAFLD$ref_alleles[m]))
-  all.equal(data$alleles, MAFLD$ref_alleles) # 1 mismatch T/TG vs G/T
+  sw=data$alleles==strReverse(MAFLD$ref_alleles[m])
+  if(any(sw))
+      data$alleles[sw] = MAFLD$ref_alleles[m][sw]
+  all.equal(data$alleles, MAFLD$ref_alleles[m]) # 1 mismatch T/TG vs G/T
   data=data[data$alleles==MAFLD$ref_alleles[ m ], ]
+  data=data[!is.na(SE)]
   m= match(data$pid, MAFLD$pid) 
   MAF=MAFLD$MAF[m]
   LD=MAFLD$LD[m,m]
 
-  dataset=with(data, list(snp=pid,
+  dataset=with(data,
+               list(snp=pid,
                           position=hm_BP,
                           beta=hm_BETA,
                           varbeta=SE^2,
@@ -375,10 +417,11 @@ collate_data=function(susies, datasets,nm) {
          SUSIE.FM=susies)
 }
 
-run_coloc=function(susies, datasets, nm) {
+run_coloc=function(susies, datasets) {
   ## concatenate
   message("running coloc...")
     todo <- data.table(d1=1, d2=2:length(susies))
+    nm=names(datasets)
     ## expand.grid(d1=c(names(data$ind)[1]),
     ##                   d2=c(names(data$ind)[-1]),
     ##                   stringsAsFactors=FALSE)  %>% as.data.table()
@@ -394,15 +437,16 @@ run_coloc=function(susies, datasets, nm) {
 
 make_plots=function(datasets, susies, coloc_results) {
                                         # everything
-    t2=unique(c(coloc_results$trait2, grep("Fairfax",names(datasets),value=TRUE)))
+    t2=unique(c(coloc_results$trait2, grep("Fairfax|Quach",names(datasets),value=TRUE)))
     png("coloc_all.png",height=9,width=15,units="in",res=300)
-    par(mfrow=c(3,3))
+    par(mfrow=c(4,5))
     plot_dataset(datasets[[1]], susies[[1]], main="IBD" ,xlim=c(38500000,39500000))
     for(ti in t2)
         plot_dataset(datasets[[ti]], susies[[ti]], main=ti, ,xlim=c(38500000,39500000))
     dev.off()
     print(coloc_results[ PP.H3.abf+PP.H4.abf > 0.5,.(trait2,idx2,PP.H1.abf,PP.H2.abf,PP.H3.abf,PP.H4.abf) ])
-
+    fwrite(coloc_results[ ,.(trait2,idx2,PP.H1.abf,PP.H2.abf,PP.H3.abf,PP.H4.abf) ],
+           file="coloc_results.csv")
                                         # zoom
     t2= c("Fairfax_2014_microarray_monocyte_naive", "Fairfax_2014_microarray_monocyte_LPS24")
     png("coloc_zoom.png",height=12,width=8,units="in",res=300)
