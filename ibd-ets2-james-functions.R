@@ -144,27 +144,38 @@ make_ibd_dataset=function(data, MAFLD) {
 ## plot_dataset(dataset, s)
 
 get_eqtl_files=function() {
-  raw_files=list.files(file.path(ECATDIR)) %>% grep("monocyte",.,value=TRUE)
-  lbf_files=list.files(file.path(ECATDIR,"lbf")) %>% grep("monocyte",.,value=TRUE)
+  raw_files=list.files(file.path(ECATDIR)) %>% grep("monocyte|macrophage",.,value=TRUE)
+  lbf_files=list.files(file.path(ECATDIR,"lbf")) %>% grep("monocyte|macrophage",.,value=TRUE)
   lbf2raw=sub("snp.txt","all.tsv",lbf_files) %>% gsub("lbf_|_SE","",.)
   lbf2raw %in% raw_files
-  list(lbf=lbf_files[ lbf2raw %in% raw_files ],
-       raw=lbf2raw[ lbf2raw %in% raw_files ])
+  tmp=list(lbf=lbf_files[ lbf2raw %in% raw_files ],
+           raw=lbf2raw[ lbf2raw %in% raw_files ])
+  tmp$filt=file.path("~/scratch/ibd-ets2-james",tmp$raw)
+  tmp
 }
 
-read_eqtl_data=function(eqtl_files) {
+filter_eqtl_data=function(eqtl_files) {
+    ## make datasets
+    for(i in seq_along(eqtl_files$raw)) {
+        infile=file.path(ECATDIR,eqtl_files$raw[i])
+        filtfile=eqtl_files$filt[i]
+        if(file.exists(filtfile))
+            next
+        message(basename(filtfile))
+        command=paste0("zcat ",infile," | awk '$2==21 && $3 > 38500000 && $3 < 39500000' > ",filtfile)
+        system(command)
+    }
+    file.path("~/scratch/ibd-ets2-james",eqtl_files$raw)
+}
+
+read_eqtl_data=function(eqtl_files,eqtl_filt) {
   ## make datasets
-  DATA=lapply(file.path(ECATDIR,eqtl_files$raw), function(f) {
-    tmp=tempfile()
-    message(basename(f))
-    nm=paste0("zcat ",f," | awk 'NR==1' ") %>% fread(cmd=.)
-    command=paste0("zcat ",f," | awk '$2==21 && $3 > 38500000 && $3 < 39500000' > ",tmp)
-    system(command)
-    result=fread(tmp)
-    unlink(tmp)
-    setnames(result, names(nm))
-    result[molecular_trait_id %in% c("ENSG00000157557", #"ENSG00000235888",
-                                     "ILMN_1720158") ]
+  DATA=lapply(seq_along(eqtl_filt), function(i) {
+      nm=paste0("zcat ",file.path(ECATDIR, eqtl_files$raw[i])," | awk 'NR==1' ") %>% fread(cmd=.)
+      result=fread(eqtl_filt[i])
+      setnames(result, names(nm))
+      result[molecular_trait_id %in% c("ENSG00000157557", #"ENSG00000235888",
+                                       "ILMN_1720158") ]
   })
   names(DATA)=sub(".all.tsv.gz","",eqtl_files$raw)
   DATA
@@ -177,6 +188,11 @@ read_eqtl_lbf=function(eqtl_files) {
     nm=paste0("zcat ",f," | awk 'NR==1' ") %>% fread(cmd=.)
     command=paste0("zcat ",f," |  awk '$3==21 && $4 > 38500000 && $4 < 39500000' > ",tmp)
     system(command)
+    s=file.info(tmp)$size
+    if(s==0) {
+        unlink(tmp)
+        return(NULL)
+    }
     result=fread(tmp)
     unlink(tmp)
     setnames(result, names(nm))
@@ -254,17 +270,22 @@ formatsusie_eqtl=function(LBF,CS) {
   S=lapply(seq_along(LBF), function(i) {
                                         # find credsets
     lbf=LBF[[i]]
-    use=!apply(lbf==0,2,all)
-    use=which(use) %>% setdiff(., 1:4)
+      if(is.null(lbf))
+          return(NULL)
+    ##   use=!apply(lbf==0,2,all)
+      ## use=which(use) %>% setdiff(., 1:4)
+      use=names(CS[[i]])  %>% sub("L","",.)  %>% as.numeric()
     if(!length(use))
       return(NULL)
-    tmp_susie=list(lbf_variable=t(as.matrix(lbf[,use,with=FALSE])),
+    tmp_susie=list(lbf_variable=t(as.matrix(lbf[,use+4,with=FALSE])),
                    sets=list(cs=CS[[i]], #list(as.list(structure(seq_along(use), names=paste0("L",1:length(use))))),
-                             cs_index=seq_along(use)))
+                             ## cs_index=seq_along(use)))
+                             cs_index=use))
     colnames(tmp_susie$lbf_variable)=paste(lbf$chromosome, # chromosome
                                            lbf$position, # position
                                            sep=":")
-      rownames(tmp_susie$lbf_variable)=paste0("L",seq_along(use))
+      ## rownames(tmp_susie$lbf_variable)=paste0("L",seq_along(use))
+      rownames(tmp_susie$lbf_variable)=names(CS[[i]])
       class(tmp_susie)=c(class(tmp_susie),"susie") # to fool coloc.susie
     tmp_susie
   })
@@ -300,6 +321,7 @@ make_eqtl_dataset=function(eqtl_data) {
 ## allsnp=DATA[[1]]$snp
 ## allecat=lapply(ECATDATA, "[[", "snp") %>% unlist() %>% unique()
 ## table(allecat %in% allsnp)
+
 ## table(allsnp %in% allecat)
 
 run_susie_traitlists=
@@ -341,11 +363,11 @@ run_susie=function(d1,d2,DATA,SUSIE) {
   if(cs1 & cs2) {
     tmp=coloc::coloc.susie(susie1, susie2)$summary
   } else if(!cs1 & !cs2) {
-    tmp=coloc::coloc.bf_bf(bf1,bf2)$summary
+    tmp=coloc::coloc.bf_bf(bf1,bf2,overlap.min=0)$summary
   } else if(cs1 & !cs2) {
-    tmp=coloc::coloc.susie_bf(susie1,bf2)$summary
+    tmp=coloc::coloc.susie_bf(susie1,bf2,overlap.min=0)$summary
   } else {
-    tmp=coloc::coloc.susie_bf(susie2,bf1)$summary
+    tmp=coloc::coloc.susie_bf(susie2,bf1,overlap.min=0)$summary
     ## switch trait order
     allnm=names(copy(tmp))
     setnames(tmp,c("hit1","hit2","idx1","idx2"),c("hit2","hit1","idx2","idx1"))
@@ -439,7 +461,7 @@ make_plots=function(datasets, susies, coloc_results) {
                                         # everything
     t2=unique(c(coloc_results$trait2, grep("Fairfax|Quach",names(datasets),value=TRUE)))
     png("coloc_all.png",height=9,width=15,units="in",res=300)
-    par(mfrow=c(4,5))
+    par(mfrow=c(5,5))
     plot_dataset(datasets[[1]], susies[[1]], main="IBD" ,xlim=c(38500000,39500000))
     for(ti in t2)
         plot_dataset(datasets[[ti]], susies[[ti]], main=ti, ,xlim=c(38500000,39500000))
